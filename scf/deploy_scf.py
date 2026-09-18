@@ -24,6 +24,7 @@ import base64
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -170,6 +171,77 @@ def delete_function(c, name):
     c.DeleteFunction(req)
 
 
+def _guess_account_name(addr, host):
+    d = (addr.split("@")[-1] if "@" in (addr or "") else (host or "")).lower()
+    for key, label in (("qq.com", "QQ邮箱"), ("gmail.com", "Gmail"),
+                       ("163.com", "网易163"), ("126.com", "网易126"),
+                       ("outlook.com", "Outlook"), ("hotmail.com", "Outlook"),
+                       ("foxmail.com", "Foxmail"), ("icloud.com", "iCloud")):
+        if key in d:
+            return label
+    return d or "邮箱"
+
+
+def _accounts_from(base, src):
+    """取出当前有效的多账号记录列表；没有则用单账号变量播种。
+
+    注意 base/src 是云端函数的**真实**环境变量（脱敏只作用于打印），
+    因此可以把已有账号的凭证原样带过来，无需用户重新提供。
+    """
+    spec = base.get("MAIL_ACCOUNTS") or src.get("MAIL_ACCOUNTS") or ""
+    recs = [r.strip() for r in spec.split(";") if r.strip()]
+    if recs:
+        return recs
+    addr = base.get("QQ_EMAIL_ACCOUNT") or src.get("QQ_EMAIL_ACCOUNT") or ""
+    code = base.get("QQ_EMAIL_AUTH_CODE") or src.get("QQ_EMAIL_AUTH_CODE") or ""
+    if not (addr and code):
+        return []
+    g = lambda k, d: (base.get(k) or src.get(k) or d)  # noqa: E731
+    host = g("IMAP_HOST", "imap.qq.com")
+    return ["|".join([_guess_account_name(addr, host), addr, code, host,
+                      g("IMAP_PORT", "993"), g("IMAP_NEED_ID", "auto"),
+                      g("TRASH_FOLDER", "")])]
+
+
+def _apply_account_edits(recs, add_spec, remove_name):
+    """按邮箱地址去重后新增 / 移除账号，返回 MAIL_ACCOUNTS 字符串。"""
+    def addr_of(rec):
+        f = rec.split("|")
+        return f[1].strip().lower() if len(f) > 1 else ""
+
+    def name_of(rec):
+        f = rec.split("|")
+        return (f[0].strip().lower() if f and f[0].strip()
+                else _guess_account_name(f[1] if len(f) > 1 else "", "").lower())
+
+    if remove_name:
+        want = remove_name.strip().lower()
+        kept = [r for r in recs if addr_of(r) != want and name_of(r) != want]
+        recs = kept
+    if add_spec:
+        new_addr = addr_of(add_spec)
+        recs = [r for r in recs if addr_of(r) != new_addr]
+        recs.append(add_spec.strip())
+    return ";".join(recs)
+
+
+def ensure_fresh_zip():
+    """部署前确保部署包不比 handler.py 旧，否则自动重新构建。
+
+    本脚本只上传既有的 zip，**不会自动打包**。改了 handler.py 却忘了
+    build_scf.py，就会「提示部署成功、实际跑的是旧代码」——这种静默失败很难察觉。
+    """
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "handler.py")
+    builder = os.path.join(os.path.dirname(src), "build_scf.py")
+    if not os.path.exists(ZIP_PATH):
+        print("未找到部署包，先构建…")
+        subprocess.run([sys.executable, builder], check=True)
+        return
+    if os.path.getmtime(src) > os.path.getmtime(ZIP_PATH):
+        print("⚠️ handler.py 比部署包新，自动重新构建（避免部署陈旧代码）…")
+        subprocess.run([sys.executable, builder], check=True)
+
+
 def build_env(c, args, current=None):
     src = fetch_source_env(c)
     base = dict(current or {})
@@ -192,7 +264,11 @@ def build_env(c, args, current=None):
         "COS_SECRET_KEY": pick("COS_SECRET_KEY") or cred_skey,
         "QQ_EMAIL_ACCOUNT": args.account or pick("QQ_EMAIL_ACCOUNT"),
         "QQ_EMAIL_AUTH_CODE": args.auth_code or pick("QQ_EMAIL_AUTH_CODE"),
-        "MAIL_ACCOUNTS": args.mail_accounts or pick("MAIL_ACCOUNTS"),
+        "MAIL_ACCOUNTS": (
+            _apply_account_edits(_accounts_from(base, src), args.add_account, args.remove_account)
+            if (args.add_account or args.remove_account)
+            else (args.mail_accounts or pick("MAIL_ACCOUNTS")
+                  or os.environ.get("MAIL_ACCOUNTS", ""))),
         "IMAP_HOST": args.imap_host or base.get("IMAP_HOST") or "imap.qq.com",
         "IMAP_PORT": base.get("IMAP_PORT", "993"),
         "IMAP_NEED_ID": base.get("IMAP_NEED_ID", "auto"),
@@ -206,6 +282,10 @@ def build_env(c, args, current=None):
         "MAX_PROCESS_PER_RUN": base.get("MAX_PROCESS_PER_RUN", "25"),
         "MAX_TRASH_PER_RUN": base.get("MAX_TRASH_PER_RUN", "60"),
         "IMPORTANT_DEDUP_HOURS": base.get("IMPORTANT_DEDUP_HOURS", "24"),
+        "FUNC_TIMEOUT_S": base.get("FUNC_TIMEOUT_S", "60"),
+        "IMAP_TIMEOUT": base.get("IMAP_TIMEOUT", "20"),
+        "IMAP_RETRIES": base.get("IMAP_RETRIES", "3"),
+        "ACCOUNT_BUDGET_S": base.get("ACCOUNT_BUDGET_S", "0"),
         "DRY_RUN": base.get("DRY_RUN", "1"),
         "STATE_KEY": base.get("STATE_KEY", "qq-mail-triage-state.json"),
         "DIGEST_KEY": base.get("DIGEST_KEY", "qq-mail-digest.json"),
@@ -224,12 +304,30 @@ def as_variables(env):
     return [{"Key": k, "Value": "" if v is None else str(v)} for k, v in env.items()]
 
 
+def _mask_accounts(spec):
+    """把 MAIL_ACCOUNTS 里每条记录的授权码字段替换掉，保留账号与服务器便于核对。
+
+    多账号配置把凭证内联在一行里，若不单独处理会连同授权码一起明文打印。
+    """
+    out = []
+    for rec in (spec or "").split(";"):
+        if not rec.strip():
+            continue
+        f = rec.split("|")
+        if len(f) >= 3:
+            f[2] = "***" if f[2].strip() else "(空)"
+        out.append("|".join(f))
+    return ";".join(out)
+
+
 def mask(env):
     sensitive = ("COS_SECRET_ID", "COS_SECRET_KEY", "QQ_EMAIL_AUTH_CODE")
     safe = {}
     for k, v in env.items():
         if k in sensitive:
             safe[k] = (v[:6] + "…(已脱敏)") if v else "(空)"
+        elif k == "MAIL_ACCOUNTS":
+            safe[k] = _mask_accounts(v) if v else "(空)"
         elif k in ("WECOM_WEBHOOK", "WECOM_WEBHOOK_REPORT") and v:
             safe[k] = v.split("key=")[0] + "key=***"
         else:
@@ -483,6 +581,10 @@ def main():
     ap.add_argument("--mail-accounts", metavar="SPEC",
                     help="多邮箱配置：分号分隔记录，字段用 | 分隔——"
                          "名称|邮箱|授权码|服务器|端口|是否发ID|回收站")
+    ap.add_argument("--add-account", metavar="SPEC",
+                    help="新增/覆盖一个账号（同格式），会自动把已有账号一并纳入多账号配置")
+    ap.add_argument("--remove-account", metavar="NAME_OR_ADDR",
+                    help="按名称或邮箱地址移除一个账号")
     ap.add_argument("--ad-domains", metavar="LIST",
                     help="显式营销域名（逗号分隔），命中即判广告；传空串可清空")
     ap.add_argument("--rescan", action="store_true",
@@ -492,6 +594,8 @@ def main():
     ap.add_argument("--accounts", action="store_true", help="查看已配置的邮箱账号")
     ap.add_argument("--probe", action="store_true", help="连接诊断：登录并列出文件夹，不移动邮件")
     ap.add_argument("--probe-host", help="诊断时覆盖服务器，如 imap.163.com / pop.163.com")
+    ap.add_argument("--probe-name", metavar="NAME",
+                    help="按名称探测已配置账号（用其自身凭证，无需在命令行写授权码）")
     ap.add_argument("--probe-protocol", choices=["imap", "pop3"], help="诊断协议，默认 imap")
     ap.add_argument("--probe-port", type=int, help="诊断端口，如 143/993/995/110")
     ap.add_argument("--probe-account", help="诊断时覆盖账号")
@@ -532,6 +636,8 @@ def main():
         return 0
     if args.probe:
         payload = {"action": "probe"}
+        if args.probe_name:
+            payload["name"] = args.probe_name
         if args.probe_host:
             payload["host"] = args.probe_host
         if args.probe_port:
@@ -564,6 +670,7 @@ def main():
             return 0
         return push_markdown(c, text, args.title, channel=args.channel)
 
+    ensure_fresh_zip()
     rc = create_or_update(c, args)
     if rc != 0:
         return rc

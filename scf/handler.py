@@ -44,6 +44,7 @@ import logging
 import os
 import poplib
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
@@ -112,6 +113,18 @@ ACCOUNTS = []   # 由 _reload_accounts() 填充
 MAX_BODY_BYTES = 1_000_000  # 超过 1MB 的邮件只取头部，避免超时
 DIGEST_MAX_ENTRIES = 400
 RESCAN_LIMIT = 120   # 规则调优时（rescan/ignore_handled）单轮最多重判的邮件数
+
+# ---- 连接可靠性 ----
+# 云函数单次执行总时限（秒），用于给各账号分配时间预算
+FUNC_TIMEOUT_S = int(os.environ.get("FUNC_TIMEOUT_S", "60"))
+# 单次 IMAP 连接/登录的超时。必须显式设置：imaplib 默认无超时，
+# 一次卡住会一直阻塞到云函数被强杀，把其他账号一起拖垮。
+IMAP_TIMEOUT = int(os.environ.get("IMAP_TIMEOUT", "20"))
+# 连接/登录失败的重试次数。跨国链路（如国内访问 Gmail）抖动明显，
+# 实测约一半概率首次超时，靠重试即可在下一两次尝试中成功。
+IMAP_RETRIES = int(os.environ.get("IMAP_RETRIES", "3"))
+# 单个账号的时间预算；留空则按账号数均分总时限（预留给收尾与推送的时间）
+ACCOUNT_BUDGET_S = float(os.environ.get("ACCOUNT_BUDGET_S", "0"))
 
 
 def _acct_default_name(addr, host):
@@ -651,25 +664,67 @@ def _should_send_id(acct=None):
     return bool(re.search(r"163\.com|126\.com|yeah\.net|188\.com", host, re.I))
 
 
-def _imap_connect(readonly, acct):
-    """按账号配置建立 IMAP 连接并选中收件箱。"""
+def _imap_connect_once(readonly, acct, timeout):
+    """单次尝试：建连 → 登录 →（网易系）发 ID → 选中收件箱。"""
     addr = acct.get("account") or ""
     code = acct.get("auth_code") or ""
     if not (addr and code):
-        raise RuntimeError(f"[{acct.get('name')}] 邮箱地址或授权码未配置")
+        raise RuntimeError("邮箱地址或授权码未配置")
     host = acct.get("host") or "imap.qq.com"
     port = int(acct.get("port") or 993)
-    imap = imaplib.IMAP4_SSL(host, port)
-    imap.login(addr, code)
-    # 网易系邮箱必须先发 ID，再做任何邮箱操作，否则报 Unsafe Login
-    if _should_send_id(acct):
+    imap = imaplib.IMAP4_SSL(host, port, timeout=timeout)
+    try:
+        imap.login(addr, code)
+        # 网易系邮箱必须先发 ID，再做任何邮箱操作，否则报 Unsafe Login
+        if _should_send_id(acct):
+            try:
+                imap.xatom("ID", IMAP_ID_CMD)
+                log.info("已发送 IMAP ID 命令（网易系邮箱必需）")
+            except Exception as e:
+                log.warning(f"发送 IMAP ID 命令失败（将继续尝试）: {e}")
+        imap.select("INBOX", readonly=readonly)
+        return imap
+    except Exception:
         try:
-            imap.xatom("ID", IMAP_ID_CMD)
-            log.info("已发送 IMAP ID 命令（网易系邮箱必需）")
+            imap.logout()
+        except Exception:
+            pass
+        raise
+
+
+def _imap_connect(readonly, acct, deadline=None):
+    """建立 IMAP 连接，带重试与总时限。
+
+    deadline 是 time.monotonic() 基准的绝对时刻。每次尝试的超时取
+    「基础超时」与「剩余预算」的较小值，保证一个卡住的账号不会耗尽整个函数的时间。
+
+    重试是必要的：跨国链路（如国内云服务器访问 Gmail）实测约一半概率首次超时，
+    重试 2~3 次即可覆盖绝大多数抖动。
+    """
+    name = acct.get("name") or "邮箱"
+    last = None
+    for attempt in range(1, IMAP_RETRIES + 1):
+        timeout = IMAP_TIMEOUT
+        if deadline is not None:
+            remain = deadline - time.monotonic()
+            if remain <= 2:
+                raise TimeoutError(
+                    f"账号「{name}」时间预算已耗尽" + (f"（上次错误：{last}）" if last else ""))
+            timeout = max(2, min(IMAP_TIMEOUT, int(remain)))
+        try:
+            return _imap_connect_once(readonly, acct, timeout)
         except Exception as e:
-            log.warning(f"发送 IMAP ID 命令失败（将继续尝试）: {e}")
-    imap.select("INBOX", readonly=readonly)
-    return imap
+            last = e
+            left = ("，剩余预算 %.0fs" % max(0, deadline - time.monotonic())
+                    if deadline is not None else "")
+            log.warning(f"[{name}] 第 {attempt}/{IMAP_RETRIES} 次连接失败："
+                        f"{type(e).__name__}: {e}{left}")
+            if attempt >= IMAP_RETRIES:
+                break
+            if deadline is not None and deadline - time.monotonic() < 4:
+                break
+            time.sleep(min(1.5 * attempt, 3))
+    raise last
 
 
 def _find_trash(imap, acct=None):
@@ -767,22 +822,23 @@ def _move_to_trash(imap, uids, trash):
 
 # ---------------- 主流程 ----------------
 
-def _run_account(acct, dry, handled, state, digest, ignore_handled=False):
+def _run_account(acct, dry, handled, state, digest, ignore_handled=False, deadline=None):
     """巡检单个邮箱账号。
 
     handled 为该账号「已处理 UID」集合，函数内会就地更新（仅在非 dry 时持久化）。
     state / digest 为共享的云端状态对象，按账号分区写入。
     ignore_handled=True 用于规则调优：忽略去重、按当前规则重新判定全部邮件，
     但**始终不写状态、不移动邮件**。
+    deadline 为 time.monotonic() 基准的绝对时刻，限制本账号的总耗时。
     """
     result = {"account": acct.get("name"), "address": acct.get("account"),
               "host": acct.get("host"), "code": 0, "dry_run": dry}
 
     try:
-        imap = _imap_connect(dry, acct)
+        imap = _imap_connect(dry, acct, deadline)
     except Exception as e:
         result["code"] = 1
-        result["msg"] = f"IMAP 连接失败: {e}"
+        result["msg"] = f"IMAP 连接失败: {type(e).__name__}: {e}"
         return result
 
     try:
@@ -1064,6 +1120,8 @@ def _run(force_dry=None, ignore_handled=False):
             handled_map[first] = [str(x) for x in legacy]
 
     per_account, warnings = [], []
+    # 每个账号的时间预算：未显式配置则按账号数均分总时限（预留收尾时间）
+    budget = ACCOUNT_BUDGET_S or max(15.0, (FUNC_TIMEOUT_S - 8) / max(1, len(ACCOUNTS)))
     for acct in ACCOUNTS:
         name = acct.get("name") or "默认"
         if not (acct.get("account") and acct.get("auth_code")):
@@ -1072,9 +1130,10 @@ def _run(force_dry=None, ignore_handled=False):
             per_account.append({"account": name, "code": 3, "msg": msg})
             continue
         handled = set(str(x) for x in handled_map.get(name, []))
+        deadline = time.monotonic() + budget
         try:
             per_account.append(
-                _run_account(acct, dry, handled, state, digest, ignore_handled))
+                _run_account(acct, dry, handled, state, digest, ignore_handled, deadline))
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
             warnings.append(f"[{name}] {msg}")
@@ -1114,12 +1173,23 @@ def _probe(ev=None):
     对比不同服务器或凭证组合。
     """
     ev = ev or {}
-    # 未显式传入时，回退到第一个已配置账号（多账号下 IMAP_HOST/ACCOUNT 可能为空）
-    first = (ACCOUNTS[0] if ACCOUNTS else {})
-    host = ev.get("host") or first.get("host") or IMAP_HOST
-    port = int(ev.get("port") or first.get("port") or IMAP_PORT)
-    account = ev.get("account") or first.get("account") or ACCOUNT
-    code = ev.get("auth_code") or first.get("auth_code") or AUTH_CODE
+    # 选择目标账号：显式指定 name 时按名称（或邮箱地址）匹配已配置账号，
+    # 这样校验某个账号时无需把授权码写进命令。
+    target, want = None, (ev.get("name") or "").strip().lower()
+    if want:
+        target = next((a for a in ACCOUNTS
+                       if (a.get("name") or "").lower() == want
+                       or (a.get("account") or "").lower() == want), None)
+        if target is None:
+            return {"code": 1, "probe": {
+                "error": f"未找到账号「{ev.get('name')}」",
+                "configured": [a.get("name") for a in ACCOUNTS]}}
+    if target is None:
+        target = ACCOUNTS[0] if ACCOUNTS else {}
+    host = ev.get("host") or target.get("host") or IMAP_HOST
+    port = int(ev.get("port") or target.get("port") or IMAP_PORT)
+    account = ev.get("account") or target.get("account") or ACCOUNT
+    code = ev.get("auth_code") or target.get("auth_code") or AUTH_CODE
     protocol = (ev.get("protocol") or "imap").lower()
 
     out = {"host": f"{host}:{port}", "protocol": protocol, "account": account,
@@ -1274,6 +1344,10 @@ def _reload_globals():
     g["MAX_TRASH"] = int(os.environ.get("MAX_TRASH_PER_RUN", "60"))
     g["DRY_RUN"] = os.environ.get("DRY_RUN", "0") == "1"
     g["IMPORTANT_DEDUP_HOURS"] = float(os.environ.get("IMPORTANT_DEDUP_HOURS", "24"))
+    g["FUNC_TIMEOUT_S"] = int(os.environ.get("FUNC_TIMEOUT_S", "60"))
+    g["IMAP_TIMEOUT"] = int(os.environ.get("IMAP_TIMEOUT", "20"))
+    g["IMAP_RETRIES"] = int(os.environ.get("IMAP_RETRIES", "3"))
+    g["ACCOUNT_BUDGET_S"] = float(os.environ.get("ACCOUNT_BUDGET_S", "0"))
     g["PROTECT_EXTRA"] = [s.strip().lower()
                           for s in os.environ.get("PROTECT_EXTRA", "").split(",") if s.strip()]
     g["AD_DOMAINS"] = [s.strip().lower()
