@@ -26,6 +26,9 @@ report.md
 scf/report.md
 *.log
 
+# ---- 工具在本目录生成的工作数据（含运行日志与邮件内容摘要，绝不入库）----
+.workbuddy/
+
 # ---- 编辑器 / 系统 ----
 .vscode/
 .idea/

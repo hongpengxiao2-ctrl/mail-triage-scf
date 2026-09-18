@@ -192,11 +192,17 @@ def build_env(c, args, current=None):
         "COS_SECRET_KEY": pick("COS_SECRET_KEY") or cred_skey,
         "QQ_EMAIL_ACCOUNT": args.account or pick("QQ_EMAIL_ACCOUNT"),
         "QQ_EMAIL_AUTH_CODE": args.auth_code or pick("QQ_EMAIL_AUTH_CODE"),
+        "MAIL_ACCOUNTS": args.mail_accounts or pick("MAIL_ACCOUNTS"),
         "IMAP_HOST": args.imap_host or base.get("IMAP_HOST") or "imap.qq.com",
         "IMAP_PORT": base.get("IMAP_PORT", "993"),
         "IMAP_NEED_ID": base.get("IMAP_NEED_ID", "auto"),
         "SCAN_DAYS": base.get("SCAN_DAYS", "7"),
         "QR_EXPIRE_MINUTES": base.get("QR_EXPIRE_MINUTES", "30"),
+        "CODE_EXPIRE_MINUTES": base.get("CODE_EXPIRE_MINUTES", "30"),
+        "CODE_TRASH_PROTECTED": base.get("CODE_TRASH_PROTECTED", "0"),
+        "AD_DOMAINS": (args.ad_domains if args.ad_domains is not None
+                       else (base.get("AD_DOMAINS") or "")),
+        "AD_EXTRA_KEYWORDS": base.get("AD_EXTRA_KEYWORDS") or "",
         "MAX_PROCESS_PER_RUN": base.get("MAX_PROCESS_PER_RUN", "25"),
         "MAX_TRASH_PER_RUN": base.get("MAX_TRASH_PER_RUN", "60"),
         "IMPORTANT_DEDUP_HOURS": base.get("IMPORTANT_DEDUP_HOURS", "24"),
@@ -211,8 +217,11 @@ def build_env(c, args, current=None):
 
 
 def as_variables(env):
-    """腾讯云 SCF 的 Environment.Variables 要求 array 类型 [{Key,Value}]，不是 dict。"""
-    return [{"Key": k, "Value": v} for k, v in env.items()]
+    """腾讯云 SCF 的 Environment.Variables 要求 array 类型 [{Key,Value}]，不是 dict。
+
+    同时把所有 None 归一化为空串：SCF 不接受 Value 为 null。
+    """
+    return [{"Key": k, "Value": "" if v is None else str(v)} for k, v in env.items()]
 
 
 def mask(env):
@@ -471,6 +480,16 @@ def main():
     ap.add_argument("--account", help="邮箱地址")
     ap.add_argument("--auth-code", help="邮箱授权码")
     ap.add_argument("--imap-host", help="IMAP 服务器，如 imap.163.com / imap.qq.com")
+    ap.add_argument("--mail-accounts", metavar="SPEC",
+                    help="多邮箱配置：分号分隔记录，字段用 | 分隔——"
+                         "名称|邮箱|授权码|服务器|端口|是否发ID|回收站")
+    ap.add_argument("--ad-domains", metavar="LIST",
+                    help="显式营销域名（逗号分隔），命中即判广告；传空串可清空")
+    ap.add_argument("--rescan", action="store_true",
+                    help="规则调优：忽略去重，按当前规则重判全部邮件（只读，不改动邮箱）")
+    ap.add_argument("--reclaim", action="store_true",
+                    help="重新清理：按当前规则重判全部邮件并真正移入回收站（会改动邮箱）")
+    ap.add_argument("--accounts", action="store_true", help="查看已配置的邮箱账号")
     ap.add_argument("--probe", action="store_true", help="连接诊断：登录并列出文件夹，不移动邮件")
     ap.add_argument("--probe-host", help="诊断时覆盖服务器，如 imap.163.com / pop.163.com")
     ap.add_argument("--probe-protocol", choices=["imap", "pop3"], help="诊断协议，默认 imap")
@@ -499,6 +518,17 @@ def main():
         return show_status(c)
     if args.channels:
         invoke(c, {"action": "channels"})
+        return 0
+    if args.accounts:
+        invoke(c, {"action": "accounts"})
+        return 0
+    if args.rescan:
+        print("=== 规则调优重判（忽略去重，只读不改动邮箱）===")
+        invoke(c, {"action": "rescan"}, wait=120)
+        return 0
+    if args.reclaim:
+        print("=== 重新清理（按当前规则重判，会真正移入回收站）===")
+        invoke(c, {"action": "reclaim"}, wait=120)
         return 0
     if args.probe:
         payload = {"action": "probe"}

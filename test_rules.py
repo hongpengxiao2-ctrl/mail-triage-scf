@@ -67,6 +67,69 @@ CASES = [
     ("保护域含二维码也不清理", "IMPORTANT", c(
         subject="登录确认二维码", from_addr="service@icbc.com.cn", body_text="扫描二维码",
         image_count=1, age_min=120)),
+
+    # ==== 真实邮件回归样本（2026-09-17 用户邮箱实测，主题/发件人原样照抄）====
+    # 平台营销推送的典型特征：主题很"干净"（不含促销词汇），
+    # 靠「批量发件人特征 + 广告/运营词」组合判定才能识别。
+    ("Gate 积分活动（真实）", "SPAM", c(
+        subject="第四期事件积分活动正式开启，交易即得刮刮卡，解锁多重奖励",
+        from_addr="no-reply@notice.gate.com", from_name="gate")),
+    ("Gate 资金就绪（真实）", "SPAM", c(
+        subject="资金已准备就绪 — 立即开始您的首笔现货交易",
+        from_addr="no-reply@remind.gate.com", from_name="gate",
+        body_text="若不想再收到此类邮件，请点击下方链接取消订阅")),
+    ("Gate 新手奖励到期（真实）", "SPAM", c(
+        subject="您的新手奖励即将到期", from_addr="no-reply@remind.gate.com",
+        from_name="gate", body_text="如需退订请联系客服")),
+    ("Gate 任务奖池（真实）", "SPAM", c(
+        subject="Gate Booster：参与发帖 & 预测任务，瓜分 44,800 CNPY 奖池",
+        from_addr="no-reply@notice.gate.com", from_name="gate")),
+    ("Gate 邮箱验证链接（真实）→过期即清", "CODE_EXPIRED", c(
+        subject="[Gate Card]邮箱验证", from_addr="no-reply@alert.gate.com",
+        from_name="gate", age_min=9999)),
+    ("Instagram 关注建议（真实）", "SPAM", c(
+        subject="user123，在动态中查看 arifjanivich.16 、 zzqi1956 和更多账户",
+        from_addr="follow-suggestions@mail.instagram.com", from_name="instagram")),
+    ("Instagram Reels 回顾（真实）", "SPAM", c(
+        subject="user123，查看来自 therepostreels 和其他人的 Reels",
+        from_addr="posts-recap@mail.instagram.com", from_name="instagram")),
+    ("Instagram 精彩时刻（真实）", "SPAM", c(
+        subject="user123，快来看看你错过的精彩时刻",
+        from_addr="posts-recaps@mail.instagram.com", from_name="instagram")),
+    ("EA 问卷邀约（真实）", "SPAM", c(
+        subject="《战地风云》工作室期待您的反馈", from_addr="ea@e.ea.com",
+        from_name="ea", list_unsub="<https://x.com/u>")),
+
+    # 🔴 以下三条是最关键的护栏：这些邮件同样来自批量地址，
+    #    若组合判定缺少「强重要词」保护就会被误删。
+    ("Google 安全提醒（真实）→不得判广告", "IMPORTANT", c(
+        subject="user@example.com 的安全提醒",
+        from_addr="no-reply@accounts.google.com", from_name="google")),
+    (" Instagram 账号安全（真实）→不得判广告", "IMPORTANT", c(
+        subject="有人尝试登录你的 Instagram 账号",
+        from_addr="security@mail.instagram.com", from_name="instagram")),
+    ("真人来信（真实）", "IMPORTANT", c(
+        subject="[API VibeCoding] 通知", from_addr="sender@qq.com",
+        from_name="api vibecoding")),
+
+    # ==== 验证码规则 ====
+    ("验证码已过期→回收站", "CODE_EXPIRED", c(
+        subject="【验证码】您的登录验证码为 8842", from_addr="no-reply@security.com",
+        age_min=45)),
+    ("验证码未过期→重要", "IMPORTANT", c(
+        subject="【验证码】您的登录验证码为 8842", from_addr="no-reply@security.com",
+        age_min=5)),
+    ("数字在前也识别（验证码）", "CODE_EXPIRED", c(
+        subject="8842 是您的登录验证码", from_addr="no-reply@security.com", age_min=60)),
+    ("验证码+保护域→跳过清理", "IMPORTANT", c(
+        subject="【验证码】您的支付验证码 668899", from_addr="service@icbc.com.cn",
+        age_min=180)),
+    ("正文顺带提及验证码→不判", "NORMAL", c(
+        subject="请查收本月的使用报告", from_addr="no-reply@shop-example.com",
+        body_text="请勿将验证码告知他人，谨防诈骗")),
+    ("验证链接已过期→回收站", "CODE_EXPIRED", c(
+        subject="请完成邮箱验证以激活账号", from_addr="no-reply@some-service.com",
+        age_min=600)),
 ]
 
 

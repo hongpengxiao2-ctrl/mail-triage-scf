@@ -17,7 +17,11 @@
 | **绝不改已读状态** | 读取统一用 `BODY.PEEK`，不会把未读邮件悄悄标成已读 |
 | **演练模式** | `DRY_RUN=1` 只判定不动作，且**不写去重状态**，避免正式运行时把邮件误判为「已处理」 |
 | **防批量误伤** | 单轮处理量与移入回收站数量双上限；回收站定位失败则不退化为删除 |
-| **加权计分分类** | 多信号累加（主题词/发件人特征/批量头/`Precedence`），普通域与免费邮箱门槛不同 |
+| **加权计分分类** | 多信号累加（广告词/运营词/发件人特征/批量头/退订指引/`Precedence`），普通域与免费邮箱门槛不同 |
+| **组合判定识别平台营销** | 「批量发件人特征 + 广告或退订特征」即可判定，覆盖主题不露声色的平台推送；并用强重要词护栏防止误杀账号安全邮件 |
+| **一次性凭证自动清理** | 验证码（关键词 + 邻近数字）与验证链接邮件过期即清，避免收件箱被一次性码堆满 |
+| **多邮箱合并日报** | `MAIL_ACCOUNTS` 一次巡检多个邮箱，状态按账号隔离，单账号失败不影响其他账号 |
+| **清理可审计** | 每日日报单列「已清理」段落，列出被移入回收站的邮件与判定原因 |
 | **双信号二维码判定** | 必须「含图片」且「命中关键词」才判过期，避免把账单、验证码误删 |
 | **硬保护域** | `edu.cn` / `gov.cn` / 银行 / 12306 / 支付宝等命中即永不清理 |
 | **推送去重** | 同一「发件人+主题」在窗口内只推一次，杜绝同一告警连发 9 封刷屏 |
@@ -55,18 +59,46 @@
 
 `WECOM_WEBHOOK_REPORT` 留空时**自动回退到 `WECOM_WEBHOOK`**，不会静默丢消息。可用 `--channels` 查看当前生效状态。
 
+## 多邮箱支持
+
+用 `MAIL_ACCOUNTS` 可让一次巡检覆盖**多个邮箱**，结果合并到同一份日报：
+
+```
+MAIL_ACCOUNTS=QQ|me@qq.com|授权码|imap.qq.com;Gmail|me@gmail.com|应用专用密码|imap.gmail.com|993|0|[Gmail]/Trash
+```
+
+分号分隔记录，字段用 `|` 分隔，字段顺序为
+`名称|邮箱地址|授权码|IMAP服务器|端口|是否发ID命令|回收站文件夹`，后四项可省略。
+未配置 `MAIL_ACCOUNTS` 时自动回退到单账号环境变量（向后兼容）。
+
+- **状态按账号隔离**：`state.handled = {账号名: [uid...]}`，账号之间不会互相干扰；
+  旧版扁平结构会在首次运行时自动迁移到第一个账号名下。
+- **单账号失败不影响其他账号**：每个账号独立连接、独立报错，返回体里逐账号给出明细。
+- **Gmail 注意事项**：
+  - 认证需要 **应用专用密码**（Google 账号需先开启两步验证：账号 → 安全性 → 应用专用密码），
+    不能使用登录密码；
+  - 需在 Gmail 设置里启用 IMAP；
+  - 回收站不是默认命名，**必须显式指定** `[Gmail]/Trash`（本项目已内置该名称的自动识别兜底，
+    但显式配置更稳妥）；
+  - 只扫描 `INBOX`，不会触碰已归档的 `[Gmail]/All Mail`。
+
 ## 运行架构
 
 ```
 腾讯云函数 qq-mail-triage（ap-guangzhou · Python3.10 · 每 5 分钟）
-  ├─ IMAP 读取收件箱近 7 天邮件
-  ├─ 三分类：SPAM / QR_EXPIRED → 移入回收站
-  │            IMPORTANT → 立刻推送「告警机器人」
-  │            NORMAL    → 写入 COS 日报暂存
-  └─ 去重状态与日报暂存写入 COS 存储桶
-                    │
-WorkBuddy 每日 10:00 ─┴─→ 读取暂存 → 生成中文摘要日报 → 推送「日报机器人」→ 清空暂存
+  ├─ 遍历 MAIL_ACCOUNTS 中的每个邮箱（QQ / Gmail / …）
+  │    ├─ IMAP 读取收件箱近 7 天邮件
+  │    ├─ 四分类：SPAM / CODE_EXPIRED / QR_EXPIRED → 移入该账号的回收站
+  │    │            IMPORTANT → 立刻推送「告警机器人」
+  │    │            NORMAL    → 写入 COS 日报暂存
+  │    └─ 去重状态按账号分区写入 COS
+  │
+WorkBuddy 每日 10:00 ─┴─→ 读取暂存（保留 + 已清理）→ 生成中文摘要日报
+                            → 推送「日报机器人」→ 清空暂存
 ```
+
+四类标签：`SPAM`（广告营销）、`CODE_EXPIRED`（失效验证码/验证链接）、
+`QR_EXPIRED`（失效二维码）、`IMPORTANT`、`NORMAL`（保留）。
 
 本函数与既有函数**完全独立**，只共用一个 COS 存储桶（键名不同），互不影响。
 若希望从某个既有函数继承企业微信 Webhook 与 COS 配置，设置环境变量
@@ -122,6 +154,18 @@ python deploy_scf.py --probe --probe-host imap.163.com --probe-code 新授权码
 
 # 查看双通道配置状态（不回显 URL）
 python deploy_scf.py --channels
+
+# 查看已配置的邮箱账号（不回显凭证）
+python deploy_scf.py --accounts
+
+# 规则调优：忽略去重、按当前规则重判全部邮件（只读，不改动邮箱）
+python deploy_scf.py --rescan
+
+# 重新清理：按当前规则重判并真正移入回收站（会改动邮箱）——改完规则后让存量邮件也生效
+python deploy_scf.py --reclaim
+
+# 多邮箱配置（QQ + Gmail 合并到同一份日报）
+python deploy_scf.py --mail-accounts "QQ|me@qq.com|授权码|imap.qq.com;Gmail|me@gmail.com|应用专用密码|imap.gmail.com|993|0|[Gmail]/Trash"
 
 # 演练：只判定、不移动邮件（首次验证务必先跑这个）
 python deploy_scf.py --preview
@@ -195,13 +239,44 @@ python handler.py --test-rules         # 规则自检
 
 | 信号 | 分值 |
 | --- | --- |
-| 主题命中广告关键词（每个，上限 2 分） | +1 / 个 |
-| 发件人为 `noreply` / `newsletter` / `marketing` / `edm` 等批量特征 | +1 |
-| Message-ID 含 `bulk` / `mailchimp` / `sendgrid` 等 | +1 |
+| 主题命中**广告词**（促销语义，每个 +1，上限 2 分） | +1 / 个 |
+| 主题命中**运营词**（平台互动语义，上限 1 分） | +1 |
+| 发件人为批量特征（`no-reply` / `posts-recap` / `follow-suggestions` 等）或域名含营销子域 | +1 |
+| Message-ID 含 `bulk` / `mailchimp` / `sendgrid` / `klaviyo` 等 | +1 |
 | 含 `List-Unsubscribe` 一键退订头 | +1 |
+| **正文**含退订措辞（取消订阅 / unsubscribe / manage preferences） | +1 |
 | `Precedence: bulk/list/junk` | +2 |
 
 **门槛**：普通域名 ≥ 2 分；免费邮箱（qq / 163 / gmail 等，视作真人来信）≥ 4 分。
+
+### 组合判定（识别平台营销推送）
+
+平台营销邮件的主题往往很干净——「快来看看你错过的精彩时刻」不含任何促销词汇，
+单靠计分永远达不到门槛。但它们有一个共同特征：**发件人一定是批量地址**。
+
+因此增加一条组合规则：
+
+> **批量发件人特征 +（任一广告词 / 运营词 / 退订头 / 正文退订措辞）→ 判为广告**
+
+这条规则能稳定识别 Gate 活动推送、Instagram 关注建议与回顾、EA 问卷邀约这类邮件。
+
+**必要的护栏**：`STRONG_IMPORTANT_KEYWORDS`（验证码、安全提醒、异常登录、账单、订单、
+面试、offer 等）命中时**禁止判为广告**。否则 Google 安全提醒会被误杀——它正是由
+`no-reply@accounts.google.com` 发出的，满足「批量发件人特征」。
+护栏还会排除与广告词重叠的强重要词：英文 `offer` 既是招聘录用也是促销用语，
+出现在 `exclusive offer` 中时不再触发保护。
+
+### 验证码与验证链接邮件
+
+| 类型 | 判定条件 | 行为 |
+| --- | --- | --- |
+| 验证码 | 关键词 + **邻近的 4~8 位数字**（两种书写顺序都识别） | 超过 `CODE_EXPIRE_MINUTES`（默认 30 分钟）→ 移入回收站；未超时 → 重要 |
+| 验证链接 | 邮箱验证 / 激活账号 / confirm your email 等 | 同上（本身即一次性凭证，无需数字） |
+
+要求「关键词 + 邻近数字」是为了避免把正文里「请勿将验证码告知他人」这类顺带提及误判。
+
+**保护域例外**：银行 / 政务 / 支付宝等保护域内的邮件默认**不清理**，即使内容是验证码。
+如需一并清理，设 `CODE_TRASH_PROTECTED=1`。
 
 ### 重要邮件即时推送去重
 
@@ -235,10 +310,15 @@ python handler.py --test-rules         # 规则自检
 | `IMAP_HOST` | `imap.qq.com` | IMAP 服务器；网易邮箱填 `imap.163.com` |
 | `IMAP_PORT` | 993 | IMAP 端口 |
 | `IMAP_NEED_ID` | `auto` | 网易系邮箱必须先发 `ID` 命令；`auto` 按主机名自动判断 |
+| `MAIL_ACCOUNTS` | 空 | **多邮箱配置**（详见上文）；留空则用上面的单账号变量 |
 | `WECOM_WEBHOOK` | — | 告警机器人 Webhook |
 | `WECOM_WEBHOOK_REPORT` | 空 | 日报机器人 Webhook；留空回退到告警机器人 |
 | `SCAN_DAYS` | 7 | 扫描最近多少天（含已读） |
 | `QR_EXPIRE_MINUTES` | 30 | 二维码失效阈值（分钟） |
+| `CODE_EXPIRE_MINUTES` | 30 | 验证码 / 验证链接失效阈值（分钟） |
+| `CODE_TRASH_PROTECTED` | 0 | 1=验证码在保护域内也清理；0=保护域跳过 |
+| `AD_DOMAINS` | 空 | 显式营销域名（逗号分隔子串），命中即判广告 |
+| `AD_EXTRA_KEYWORDS` | 空 | 自定义补充广告词（逗号分隔） |
 | `MAX_PROCESS_PER_RUN` | 25 | 单轮处理上限，防止超时 |
 | `MAX_TRASH_PER_RUN` | 60 | 单轮最多移入回收站，防止批量误伤 |
 | `IMPORTANT_DEDUP_HOURS` | 24 | 重要邮件即时推送的去重窗口（小时）；`0` 关闭去重 |
